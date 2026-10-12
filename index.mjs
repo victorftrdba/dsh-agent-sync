@@ -14,8 +14,11 @@
 
 import { homedir } from 'node:os'
 import { execFileSync } from 'node:child_process'
-import { basename, dirname, join } from 'node:path'
-import { cp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { parse as parseTomlDocument } from 'smol-toml'
+import { LineCounter, parseDocument } from 'yaml'
+import { chmod, cp, lstat, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
@@ -66,57 +69,48 @@ async function removePath(p) {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal TOML parser (Codex config.toml)
+// MCP configuration parsers
 // ---------------------------------------------------------------------------
 
-function parseTomlValue(s) {
-  s = String(s || '').trim()
-  if (!s) return ''
-  if (s.startsWith('[')) {
-    return s.slice(1, s.lastIndexOf(']') < 0 ? s.length : s.lastIndexOf(']'))
-      .split(',').map((x) => parseTomlValue(x)).filter((x) => x !== '')
-  }
-  if (s.startsWith('"')) {
-    let t = s.slice(1)
-    if (t.endsWith('"')) t = t.slice(0, -1)
-    return t.replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\\n/g, '\n').replace(/\\t/g, '\t')
-  }
-  if (s.startsWith("'")) {
-    let t = s.slice(1)
-    if (t.endsWith("'")) t = t.slice(0, -1)
-    return t
-  }
-  if (s === 'true') return true
-  if (s === 'false') return false
-  const n = Number(s)
-  if (!Number.isNaN(n) && s !== '') return n
-  return s
+function parseFailure(format, source, error, lineCounter) {
+  const position = lineCounter && Array.isArray(error?.pos) ? lineCounter.linePos(error.pos[0]) : error
+  const number = (value) => Number.isSafeInteger(value) && value > 0 ? value : null
+  return { format, source, line: number(position?.line), column: number(position?.column ?? position?.col) }
 }
 
-function parseToml(text) {
-  const root = {}
-  const stack = [root]
-  const current = () => stack[stack.length - 1]
-  for (const raw of String(text || '').split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line || line.startsWith('#')) continue
-    if (line.startsWith('[')) {
-      const header = line.slice(1, line.lastIndexOf(']')).trim()
-      const keys = header.split('.').map((k) => k.trim())
-      let node = root
-      for (const k of keys) {
-        if (!node[k] || typeof node[k] !== 'object') node[k] = {}
-        node = node[k]
-      }
-      stack.push(node)
-      continue
-    }
-    const eq = line.indexOf('=')
-    if (eq < 0) continue
-    const key = line.slice(0, eq).trim().replace(/^"|"$/g, '').replace(/^'|'$/g, '')
-    current()[key] = parseTomlValue(line.slice(eq + 1))
+function parseToml(text, source, section = 'mcp_servers') {
+  try {
+    const parsed = parseTomlDocument(text)
+    const servers = section === 'mcp' ? (parsed.mcp?.servers ?? parsed.mcp) : parsed[section]
+    return { servers: servers && typeof servers === 'object' && !Array.isArray(servers) ? servers : {} }
+  } catch (error) {
+    return { servers: {}, error: parseFailure('toml', source, error) }
   }
-  return root
+}
+
+function extractMcpServers(text, source, format = 'yaml', key) {
+  let parsed
+  if (format === 'json') {
+    try { parsed = JSON.parse(text) }
+    catch { return { servers: {}, error: parseFailure('json', source) } }
+  } else {
+    const lineCounter = new LineCounter()
+    try {
+      const document = parseDocument(text, { lineCounter, prettyErrors: false, strict: true })
+      if (document.errors.length || document.warnings.length) {
+        return { servers: {}, error: parseFailure('yaml', source, document.errors[0] || document.warnings[0], lineCounter) }
+      }
+      parsed = document.toJS({ maxAliasCount: 100 })
+    } catch (error) {
+      return { servers: {}, error: parseFailure('yaml', source, error, lineCounter) }
+    }
+  }
+  const keys = key ? [key] : ['mcpServers', 'mcp_servers', 'mcp']
+  for (const name of keys) {
+    const servers = parsed?.[name]
+    if (servers && typeof servers === 'object' && !Array.isArray(servers)) return { servers }
+  }
+  return { servers: {} }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,41 +229,42 @@ function sanitizeSkillName(name) {
   return s
 }
 
-function normalizeMcp(name, raw, source) {
-  raw = raw && typeof raw === 'object' ? raw : {}
-  const type = raw.type || (raw.command ? 'stdio' : raw.url ? 'http' : undefined)
+function normalizeMcp(name, raw, source, pathBase) {
   const serverName = sanitizeServerName(name)
-  if (type === 'stdio' || (type === undefined && raw.command)) {
+  const invalid = (code) => ({ name: serverName, source, error: { code, source, name: serverName } })
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return invalid('invalid_mcp_config')
+  if (raw.enabled === false) return invalid('source_disabled')
+  const type = raw.type || (raw.command ? 'stdio' : raw.url ? 'http' : undefined)
+  if (type === 'stdio') {
+    if (typeof raw.command !== 'string' || !raw.command.trim() || raw.command.includes('\0')) return invalid('invalid_command')
+    if (raw.args !== undefined && (!Array.isArray(raw.args) || raw.args.some((arg) => typeof arg !== 'string' || arg.includes('\0')))) return invalid('invalid_args')
+    if (raw.cwd !== undefined && (typeof raw.cwd !== 'string' || !raw.cwd.trim() || raw.cwd.includes('\0'))) return invalid('invalid_cwd')
+    const cwd = raw.cwd === undefined ? undefined : isAbsolute(raw.cwd) ? raw.cwd : pathBase ? resolve(pathBase, raw.cwd) : undefined
+    if (raw.cwd !== undefined && !cwd) return invalid('missing_path_base')
+    const pathlike = raw.command.includes('/') || raw.command.includes('\\')
+    const commandBase = cwd || pathBase
+    if (pathlike && !isAbsolute(raw.command) && !commandBase) return invalid('missing_path_base')
+    const command = pathlike && !isAbsolute(raw.command) ? resolve(commandBase, raw.command) : raw.command
     const env = {}
-    if (raw.env && typeof raw.env === 'object') {
-      for (const k of Object.keys(raw.env)) {
-        const v = raw.env[k]
-        if (typeof v === 'string' || typeof v === 'number') env[k] = String(v)
+    if (raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env)) {
+      for (const [key, value] of Object.entries(raw.env)) {
+        if (typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))) env[key] = String(value)
       }
     }
-    const config = {
-      serverName,
-      transport: 'stdio',
-      command: String(raw.command),
-      args: Array.isArray(raw.args) ? raw.args.map(String) : [],
-      env,
-    }
-    if (raw.cwd) config.cwd = String(raw.cwd)
-    if (raw.startup_timeout_sec) config.toolCallTimeoutMs = Number(raw.startup_timeout_sec) * 1000
+    const config = { serverName, transport: 'stdio', command, args: raw.args || [], env }
+    if (cwd) config.cwd = cwd
+    if (typeof raw.startup_timeout_sec === 'number' && Number.isFinite(raw.startup_timeout_sec) && raw.startup_timeout_sec > 0) config.toolCallTimeoutMs = raw.startup_timeout_sec * 1000
     return { name: serverName, source, config }
   }
-  if (type === 'http' || type === 'streamable-http' || raw.url) {
+  if (type === 'http' || type === 'streamable-http') {
+    if (typeof raw.url !== 'string' || !raw.url.trim()) return invalid('invalid_url')
     const headers = {}
-    if (raw.headers && typeof raw.headers === 'object') {
-      for (const k of Object.keys(raw.headers)) headers[k] = String(raw.headers[k])
+    if (raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)) {
+      for (const [key, value] of Object.entries(raw.headers)) if (typeof value === 'string') headers[key] = value
     }
-    return { name: serverName, source, config: { serverName, transport: 'streamable-http', url: String(raw.url), headers } }
+    return { name: serverName, source, config: { serverName, transport: 'streamable-http', url: raw.url, headers } }
   }
-  return {
-    name: String(name),
-    source,
-    error: type === 'sse' ? 'SSE transport is not supported by DSH (only stdio / streamable-http)' : 'unsupported MCP config',
-  }
+  return invalid(type === 'sse' ? 'unsupported_sse' : 'unsupported_transport')
 }
 
 // ---------------------------------------------------------------------------
@@ -280,17 +275,7 @@ async function scanCodex() {
   const result = { mcp: [], skills: [] }
   const tomlPath = join(HOME, '.codex', 'config.toml')
   const tomlText = await readText(tomlPath)
-  if (tomlText) {
-    try {
-      const parsed = parseToml(tomlText)
-      const servers = parsed.mcp_servers && typeof parsed.mcp_servers === 'object' ? parsed.mcp_servers : {}
-      for (const name of Object.keys(servers)) {
-        result.mcp.push({ name, source: 'codex', raw: servers[name], enabled: true })
-      }
-    } catch (e) {
-      result.error = String((e && e.message) || e)
-    }
-  }
+  if (tomlText) await pushMcp(result, 'codex', parseToml(tomlText, 'codex'), tomlPath)
   result.skills = await scanSkillsDir(join(HOME, '.codex', 'skills'))
   return result
 }
@@ -304,11 +289,11 @@ async function scanClaude() {
       const j = JSON.parse(claudeJson)
       if (j && typeof j === 'object' && j.mcpServers && typeof j.mcpServers === 'object') {
         for (const name of Object.keys(j.mcpServers)) {
-          result.mcp.push({ name, source: 'claude', raw: j.mcpServers[name], enabled: true })
+          result.mcp.push({ name, source: 'claude', raw: j.mcpServers[name], pathBase: HOME, enabled: j.mcpServers[name]?.enabled !== false })
           seenMcp.add(name)
         }
       }
-    } catch { /* ignore malformed */ }
+    } catch { result.errors = [parseFailure('json', 'claude')] }
   }
   const settingsText = await readText(join(HOME, '.claude', 'settings.json'))
   if (settingsText) {
@@ -317,11 +302,11 @@ async function scanClaude() {
       if (j && typeof j === 'object' && j.mcpServers && typeof j.mcpServers === 'object') {
         for (const name of Object.keys(j.mcpServers)) {
           if (seenMcp.has(name)) continue
-          result.mcp.push({ name, source: 'claude', raw: j.mcpServers[name], enabled: true })
+          result.mcp.push({ name, source: 'claude', raw: j.mcpServers[name], pathBase: join(HOME, '.claude'), enabled: j.mcpServers[name]?.enabled !== false })
           seenMcp.add(name)
         }
       }
-    } catch { /* ignore */ }
+    } catch { result.errors = [...(result.errors || []), parseFailure('json', 'claude')] }
   }
   const pluginsRoot = join(HOME, '.claude', 'plugins')
   const mkts = await listDir(join(pluginsRoot, 'marketplaces'))
@@ -365,6 +350,7 @@ async function scanCcswitch() {
             name: s.name || s.id,
             source: 'ccswitch',
             raw: cfg,
+            pathBase: dirname(dbPath),
             enabled: {
               claude: !!s.enabled_claude, codex: !!s.enabled_codex, gemini: !!s.enabled_gemini,
               opencode: !!s.enabled_opencode, hermes: !!s.enabled_hermes,
@@ -384,7 +370,7 @@ async function scanCcswitch() {
         }
       }
     } catch (e) {
-      result.error = String((e && e.message) || e)
+      result.errors = [parseFailure('sqlite', 'ccswitch')]
     }
   }
   result.skills.push(...await scanSkillsDir(join(HOME, '.cc-switch', 'skills')))
@@ -418,98 +404,14 @@ const ALL_SOURCES = [
   'custom',
 ]
 
-function unquoteYaml(s) {
-  s = String(s || '').trim()
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) return s.slice(1, -1)
-  return s
-}
-
-// Minimal YAML extractor for the standard `mcpServers:` mapping shape
-// ({ name: { command, args: [...], env: {...}, url, type } }).
-function parseYamlMcp(text) {
-  const servers = {}
-  let section = null
-  let current = null
-  let currentField = null
-  for (const raw of String(text || '').split(/\r?\n/)) {
-    const line = raw.replace(/\t/g, '  ')
-    const indent = /^ */.exec(line)[0].length
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    if (indent === 0 && /^(mcpServers|mcp_servers|mcp):/.test(trimmed)) {
-      section = trimmed.split(':')[0]
-      current = null
-      currentField = null
-      continue
-    }
-    if (!section) continue
-    if (indent === 2) {
-      const m = /^([A-Za-z0-9_.-]+):\s*$/.exec(trimmed)
-      if (m) { current = m[1]; servers[current] = {}; currentField = null; continue }
-    }
-    if (!current) continue
-    const eq = trimmed.indexOf(':')
-    if (eq <= 0) continue
-    const key = trimmed.slice(0, eq).trim()
-    const val = trimmed.slice(eq + 1).trim()
-    if (indent >= 4 && key === 'command') { servers[current].command = unquoteYaml(val); currentField = null; continue }
-    if (indent >= 4 && key === 'url') { servers[current].url = unquoteYaml(val); currentField = null; continue }
-    if (indent >= 4 && key === 'type') { servers[current].type = unquoteYaml(val); currentField = null; continue }
-    if (indent >= 4 && key === 'cwd') { servers[current].cwd = unquoteYaml(val); currentField = null; continue }
-    if (indent >= 4 && key === 'args') { currentField = 'args'; continue }
-    if (indent >= 4 && key === 'env') { currentField = 'env'; continue }
-    if (indent >= 4 && key === 'headers') { currentField = 'headers'; continue }
-    if (currentField === 'args' && indent >= 6) {
-      if (!servers[current].args) servers[current].args = []
-      servers[current].args.push(unquoteYaml(trimmed.replace(/^- /, '')))
-      continue
-    }
-    if ((currentField === 'env' || currentField === 'headers') && indent >= 6) {
-      const e = trimmed.indexOf(':')
-      if (e > 0) {
-        const ek = trimmed.slice(0, e).trim()
-        if (!servers[current][currentField]) servers[current][currentField] = {}
-        servers[current][currentField][ek] = unquoteYaml(trimmed.slice(e + 1).trim())
-      }
-      continue
-    }
-    if (currentField && indent < 6) currentField = null
+async function pushMcp(result, source, parsed, sourcePath) {
+  if (parsed.error) {
+    result.errors = [...(result.errors || []), parsed.error]
+    return
   }
-  return servers
-}
-
-function extractMcpServers(text) {
-  if (!text) return {}
-  try {
-    const j = JSON.parse(text)
-    if (j && typeof j === 'object' && !Array.isArray(j)) {
-      for (const key of ['mcpServers', 'mcp_servers', 'mcp']) {
-        if (j[key] && typeof j[key] === 'object' && !Array.isArray(j[key])) return j[key]
-      }
-      if (j.command || j.url) return j
-    }
-    return {}
-  } catch {
-    return parseYamlMcp(text)
-  }
-}
-
-function extractTomlMcp(parsed) {
-  const out = {}
-  const mcp = (parsed && parsed.mcp) || {}
-  const servers = mcp.servers && typeof mcp.servers === 'object' ? mcp.servers : mcp
-  if (servers && typeof servers === 'object') {
-    for (const name of Object.keys(servers)) {
-      const s = servers[name]
-      if (s && typeof s === 'object' && (s.command || s.url)) out[name] = s
-    }
-  }
-  return out
-}
-
-async function pushMcp(result, source, servers) {
-  for (const name of Object.keys(servers)) {
-    result.mcp.push({ name, source, raw: servers[name], enabled: true })
+  const pathBase = dirname(resolve(sourcePath))
+  for (const name of Object.keys(parsed.servers)) {
+    result.mcp.push({ name, source, raw: parsed.servers[name], pathBase, enabled: parsed.servers[name]?.enabled !== false })
   }
 }
 
@@ -517,7 +419,9 @@ async function scanHermes() {
   const result = { mcp: [], skills: [] }
   for (const f of ['config.yaml', 'config.yml', 'config.json']) {
     const text = await readText(join(HOME, '.hermes', f))
-    if (text) { await pushMcp(result, 'hermes', extractMcpServers(text)); break }
+    if (text) { await pushMcp(result, 'hermes', extractMcpServers(text, 'hermes', f.endsWith('.json') ? 'json' : 'yaml'), join(HOME, '.hermes', f))
+      break
+    }
   }
   result.skills = await scanSkillsDir(join(HOME, '.hermes', 'skills'))
   return result
@@ -527,7 +431,9 @@ async function scanOpencode() {
   const result = { mcp: [], skills: [] }
   for (const f of ['opencode.json', 'config.json']) {
     const text = await readText(join(HOME, '.config', 'opencode', f))
-    if (text) { await pushMcp(result, 'opencode', extractMcpServers(text)); break }
+    if (text) { await pushMcp(result, 'opencode', extractMcpServers(text, 'opencode', 'json'), join(HOME, '.config', 'opencode', f))
+      break
+    }
   }
   result.skills = await scanSkillsDir(join(HOME, '.config', 'opencode', 'skills'))
   return result
@@ -536,7 +442,7 @@ async function scanOpencode() {
 async function scanGemini() {
   const result = { mcp: [], skills: [] }
   const text = await readText(join(HOME, '.gemini', 'settings.json'))
-  if (text) await pushMcp(result, 'gemini', extractMcpServers(text))
+  if (text) await pushMcp(result, 'gemini', extractMcpServers(text, 'gemini', 'json'), join(HOME, '.gemini', 'settings.json'))
   result.skills = await scanSkillsDir(join(HOME, '.gemini', 'skills'))
   return result
 }
@@ -545,7 +451,9 @@ async function scanGrok() {
   const result = { mcp: [], skills: [] }
   for (const f of ['config.json', 'settings.json', 'mcp.json', 'config.yaml']) {
     const text = await readText(join(HOME, '.grok', f))
-    if (text) { await pushMcp(result, 'grok', extractMcpServers(text)); break }
+    if (text) { await pushMcp(result, 'grok', extractMcpServers(text, 'grok', f.endsWith('.json') ? 'json' : 'yaml'), join(HOME, '.grok', f))
+      break
+    }
   }
   result.skills = await scanSkillsDir(join(HOME, '.grok', 'skills'))
   return result
@@ -554,10 +462,8 @@ async function scanGrok() {
 async function scanKimi() {
   const result = { mcp: [], skills: [] }
   const cfgPath = join(HOME, '.kimi', 'config.toml')
-  if (await exists(cfgPath)) {
-    try { await pushMcp(result, 'kimi', extractTomlMcp(parseToml(await readText(cfgPath)))) }
-    catch (e) { result.error = String((e && e.message) || e) }
-  }
+  const text = await readText(cfgPath)
+  if (text) await pushMcp(result, 'kimi', parseToml(text, 'kimi', 'mcp'), cfgPath)
   result.skills = await scanSkillsDir(join(HOME, '.kimi', 'skills'))
   return result
 }
@@ -565,7 +471,7 @@ async function scanKimi() {
 async function scanCodebuddy() {
   const result = { mcp: [], skills: [] }
   const text = await readText(join(HOME, '.codebuddy', 'mcp.json'))
-  if (text) await pushMcp(result, 'codebuddy', extractMcpServers(text))
+  if (text) await pushMcp(result, 'codebuddy', extractMcpServers(text, 'codebuddy', 'json'), join(HOME, '.codebuddy', 'mcp.json'))
   result.skills = await scanSkillsDir(join(HOME, '.codebuddy', 'skills'))
   return result
 }
@@ -573,7 +479,7 @@ async function scanCodebuddy() {
 async function scanTrae() {
   const result = { mcp: [], skills: [] }
   const text = await readText(join(HOME, '.trae-cn', 'mcp.json'))
-  if (text) await pushMcp(result, 'trae', extractMcpServers(text))
+  if (text) await pushMcp(result, 'trae', extractMcpServers(text, 'trae', 'json'), join(HOME, '.trae-cn', 'mcp.json'))
   result.skills = await scanSkillsDir(join(HOME, '.trae-cn', 'skills'))
   return result
 }
@@ -583,7 +489,9 @@ async function scanOpenclaw() {
   for (const base of ['.openclaw', '.clawdbot']) {
     for (const f of ['config.yaml', 'config.yml', 'config.json']) {
       const text = await readText(join(HOME, base, f))
-      if (text) { await pushMcp(result, 'openclaw', extractMcpServers(text)); break }
+      if (text) { await pushMcp(result, 'openclaw', extractMcpServers(text, 'openclaw', f.endsWith('.json') ? 'json' : 'yaml'), join(HOME, base, f))
+      break
+    }
     }
     result.skills.push(...await scanSkillsDir(join(HOME, base, 'skills')))
   }
@@ -594,7 +502,7 @@ async function scanGenericAgent(def) {
   const result = { mcp: [], skills: [] }
   for (const rel of def.config) {
     const text = await readText(join(HOME, rel))
-    if (text) await pushMcp(result, def.id, extractMcpServers(text))
+    if (text) await pushMcp(result, def.id, extractMcpServers(text, def.id, 'json'), join(HOME, rel))
   }
   for (const rel of def.skills) result.skills.push(...await scanSkillsDir(join(HOME, rel)))
   return result
@@ -653,31 +561,20 @@ async function scanCustom() {
   const sources = await readSources()
   for (const s of sources) {
     try {
-      if (s.kind === 'json') {
-        const text = await readText(s.path)
+      if (s.kind === 'json' || s.kind === 'yaml' || s.kind === 'toml') {
+        const sourcePath = resolve(s.path)
+        const text = await readText(sourcePath)
         if (text) {
-          const j = JSON.parse(text)
-          const key = s.mcpKey || 'mcpServers'
-          const servers = j && typeof j === 'object' ? (j[key] || {}) : {}
-          for (const name of Object.keys(servers)) {
-            result.mcp.push({ name, source: s.id, raw: servers[name], enabled: true })
-          }
-        }
-      } else if (s.kind === 'toml') {
-        const text = await readText(s.path)
-        if (text) {
-          const parsed = parseToml(text)
-          const sec = s.section || 'mcp_servers'
-          const servers = parsed[sec] && typeof parsed[sec] === 'object' ? parsed[sec] : {}
-          for (const name of Object.keys(servers)) {
-            result.mcp.push({ name, source: s.id, raw: servers[name], enabled: true })
-          }
+          const parsed = s.kind === 'toml'
+            ? parseToml(text, s.id, s.section || 'mcp_servers')
+            : extractMcpServers(text, s.id, s.kind, s.mcpKey)
+          await pushMcp(result, s.id, parsed, sourcePath)
         }
       } else if (s.kind === 'dir') {
         for (const sk of await scanSkillsDir(s.path)) result.skills.push({ ...sk, source: s.id })
       }
-    } catch (e) {
-      result.error = (result.error || '') + `${s.id}: ${(e && e.message) || e}; `
+    } catch {
+      result.errors = [...(result.errors || []), parseFailure(s.kind, s.id)]
     }
   }
   return result
@@ -719,9 +616,8 @@ async function scanAll(sources) {
 // ---------------------------------------------------------------------------
 
 function yamlStr(v) {
-  let s = v === undefined || v === null ? '' : String(v)
-  if (s.includes("'")) s = s.replace(/'/g, "''")
-  return `'${s}'`
+  return JSON.stringify(v === undefined || v === null ? '' : String(v))
+    .replace(/[\u0085\u2028\u2029]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)
 }
 
 function renderManagedSection(entries) {
@@ -816,6 +712,66 @@ async function writeState(state) {
   await writeText(STATE_FILE, JSON.stringify(state, null, 2))
 }
 
+async function optionalBytes(path) {
+  try { return await readFile(path) }
+  catch (error) {
+    if (error.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+async function commitMcpFiles(updates) {
+  const staged = []
+  const applied = []
+  const same = (left, right) => left === null ? right === null : right !== null && left.equals(right)
+  try {
+    for (const update of updates) {
+      await mkdir(dirname(update.path), { recursive: true })
+      const info = await lstat(update.path).catch((error) => {
+        if (error.code === 'ENOENT') return null
+        throw error
+      })
+      if (info && !info.isFile()) throw new Error('invalid transaction target')
+      const record = { ...update, next: Buffer.from(update.content), stage: `${update.path}.${randomUUID()}.pending`,
+        backup: update.original === null ? null : `${update.path}.${randomUUID()}.rollback`, mode: info ? info.mode & 0o777 : 0o600 }
+      staged.push(record)
+      await writeFile(record.stage, record.next, { flag: 'wx', mode: 0o600 })
+      if (record.backup) await writeFile(record.backup, record.original, { flag: 'wx', mode: 0o600 })
+    }
+    for (const record of staged) {
+      if (!same(record.original, await optionalBytes(record.path))) throw new Error('transaction target changed')
+    }
+    for (const record of staged) {
+      if (!same(record.original, await optionalBytes(record.path))) throw new Error('transaction target changed')
+      await rename(record.stage, record.path)
+      applied.push(record)
+      await chmod(record.path, record.mode)
+    }
+    return { ok: true }
+  } catch {
+    let complete = true
+    for (const record of applied.reverse()) {
+      try {
+        if (!same(record.next, await optionalBytes(record.path))) throw new Error('transaction target changed during rollback')
+        if (record.backup) {
+          await rename(record.backup, record.path)
+          await chmod(record.path, record.mode)
+        }
+        else await rm(record.path)
+      } catch {
+        complete = false
+        record.keepBackup = true
+      }
+    }
+    return { ok: false, error: { code: 'sync_write_failed', rollback: complete ? 'complete' : 'incomplete' } }
+  } finally {
+    for (const record of staged) {
+      await rm(record.stage, { force: true }).catch(() => {})
+      if (record.backup && !record.keepBackup) await rm(record.backup, { force: true }).catch(() => {})
+    }
+  }
+}
+
 function resolveSelection(list, keys) {
   if (!list || !list.length || list.includes('all')) return [...keys]
   return list.filter((k) => keys.includes(k))
@@ -830,11 +786,12 @@ async function collectMcpCandidates(sources) {
   const byName = new Map()
   const errors = []
   for (const src of ALL_SOURCES) {
+    errors.push(...(scans[src]?.errors || []))
     const items = (scans[src] && scans[src].mcp) || []
     for (const item of items) {
-      const norm = normalizeMcp(item.name, item.raw, src)
+      const norm = normalizeMcp(item.name, item.raw, item.source || src, item.pathBase)
       if (norm.error) {
-        errors.push(`${src}/${item.name}: ${norm.error}`)
+        errors.push(norm.error)
         continue
       }
       if (!byName.has(norm.name)) byName.set(norm.name, norm)
@@ -862,8 +819,23 @@ function enabledMcpEntries(state) {
     .map((n) => ({ entryId: state.mcp[n].entryId, serverName: n, config: state.mcp[n].config }))
 }
 
-async function syncMcp(selected, opts = {}) {
-  const state = await readState()
+let mcpSync = Promise.resolve()
+
+function syncMcp(selected, opts = {}) {
+  const result = mcpSync.then(() => syncMcpNow(selected, opts)).catch(() => ({
+    ok: false, synced: [], skipped: [], errors: [{ code: 'sync_read_failed' }], profiles: [],
+  }))
+  mcpSync = result.catch(() => {})
+  return result
+}
+
+async function syncMcpNow(selected, opts = {}) {
+  const originalState = await optionalBytes(STATE_FILE)
+  let state
+  try {
+    state = originalState === null ? { mcp: {}, skills: {} } : JSON.parse(originalState.toString('utf8'))
+    if (!state || !state.mcp || typeof state.mcp !== 'object' || Array.isArray(state.mcp) || !state.skills || typeof state.skills !== 'object' || Array.isArray(state.skills)) throw new Error('invalid state')
+  } catch { return { ok: false, synced: [], skipped: [], errors: [{ code: 'invalid_sync_state' }], profiles: [] } }
   const cand = await collectMcpCandidates(opts.sources)
   const names = resolveSelection(selected, [...cand.byName.keys()])
   const synced = []
@@ -887,23 +859,27 @@ async function syncMcp(selected, opts = {}) {
   else if (config.syncProfiles !== 'all') profiles = profiles.filter((p) => p.name === config.syncProfiles)
   const entries = enabledMcpEntries(state)
   const profileResults = []
+  const updates = []
+  if (opts.profile && !profiles.length) return { ok: false, synced: [], skipped, errors: [...cand.errors, { code: 'profile_not_found' }], profiles: [] }
   for (const p of profiles) {
-    const text = await readText(p.patchPath)
+    const original = await readFile(p.patchPath)
+    const text = original.toString('utf8')
     const external = externalMcpIds(text)
     const conflicts = synced.filter((n) => external.includes(`mcp-${n}`))
     if (conflicts.length) {
-      profileResults.push({ profile: p.name, skippedConflicts: conflicts })
-      continue
+      return { ok: false, synced: [], skipped, errors: [...cand.errors, { code: 'profile_conflict', profile: p.name, names: conflicts }], profiles: [] }
     }
     const next = rebuildPatchText(text, entries)
     if (next !== text) {
-      await writeText(p.patchPath, next)
+      updates.push({ path: p.patchPath, content: next, original })
       profileResults.push({ profile: p.name, updated: true })
     } else {
       profileResults.push({ profile: p.name, updated: false })
     }
   }
-  await writeState(state)
+  updates.push({ path: STATE_FILE, content: JSON.stringify(state, null, 2), original: originalState })
+  const committed = await commitMcpFiles(updates)
+  if (!committed.ok) return { ok: false, synced: [], skipped, errors: [...cand.errors, committed.error], profiles: [] }
   return { synced, skipped, errors: cand.errors, profiles: profileResults }
 }
 
@@ -1446,13 +1422,14 @@ async function removeSkill(name) {
 
 function compactMcp(item) {
   const out = { name: item.name, source: item.source }
-  const norm = item.config ? item : normalizeMcp(item.name, item.raw, item.source)
+  const norm = item.config ? item : normalizeMcp(item.name, item.raw, item.source, item.pathBase)
   if (norm.error) { out.error = norm.error; return out }
   const c = norm.config
   out.transport = c.transport
   if (c.transport === 'stdio') {
     out.command = c.command
     if (c.args && c.args.length) out.args = c.args
+    if (c.cwd) out.cwd = c.cwd
     const envKeys = Object.keys(c.env || {})
     if (envKeys.length) out.envKeys = envKeys
   } else {
@@ -1476,6 +1453,7 @@ function compactScans(scans) {
       }),
     }
     if (s.error) out[key].error = s.error
+    if (s.errors) out[key].errors = s.errors
   }
   return out
 }
@@ -1526,7 +1504,7 @@ function registerTools(ctx) {
       const skills = args.skills && args.skills.length
         ? await syncSkills(args.skills, { sources: args.sources, overwrite: !!args.overwrite, scope: args.scope || '' })
         : null
-      return JSON.stringify({ ok: true, mcp, skills }, null, 2)
+      return JSON.stringify({ ok: mcp?.ok !== false, mcp, skills }, null, 2)
     },
   }))
 
@@ -1607,12 +1585,12 @@ function registerTools(ctx) {
 
   ctx.tools.register(textTool({
     name: 'agent_sync_sources',
-    description: 'Manage custom agent sources for scanning. action "list" returns the current sources. action "add" adds a source: {id, label, kind, path, mcpKey?, section?} where kind is "json" (path to a JSON file with an mcpServers-style object, key selectable via mcpKey, default "mcpServers"), "toml" (path to a TOML file whose MCP section is selected via section, default "mcp_servers"), or "dir" (path to a skills directory). action "delete" removes a source by id. Stored in <dshHome>/agent-sync/sources.json.',
+    description: 'Manage custom agent sources for scanning. action "list" returns the current sources. action "add" adds a source: {id, label, kind, path, mcpKey?, section?} where kind is "json" or "yaml" (path to a file with an mcpServers-style object, key selectable via mcpKey, default "mcpServers"), "toml" (path to a TOML file whose MCP section is selected via section, default "mcp_servers"), or "dir" (path to a skills directory). action "delete" removes a source by id. Stored in <dshHome>/agent-sync/sources.json.',
     parameters: {
       action: { type: 'string', enum: ['list', 'add', 'delete'], required: true, description: 'list | add | delete' },
       id: { type: 'string', description: 'Source id (required for add and delete).' },
       label: { type: 'string', description: 'Human-readable label (for add).' },
-      kind: { type: 'string', enum: ['json', 'toml', 'dir'], description: 'Source kind (for add).' },
+      kind: { type: 'string', enum: ['json', 'yaml', 'toml', 'dir'], description: 'Source kind (for add).' },
       path: { type: 'string', description: 'Absolute path (for add).' },
       mcpKey: { type: 'string', description: 'JSON key holding the MCP server map (json kind, default "mcpServers").' },
       section: { type: 'string', description: 'TOML section holding the MCP server map (toml kind, default "mcp_servers").' },
@@ -1691,7 +1669,7 @@ function registerRoutes(ctx) {
       const skills = a.skills && a.skills.length
         ? await syncSkills(a.skills, { sources: a.sources, overwrite: !!a.overwrite, scope: a.scope || '' })
         : null
-      json(res, { ok: true, mcp, skills })
+      json(res, { ok: mcp?.ok !== false, mcp, skills })
     } catch (e) { json(res, { ok: false, error: String((e && e.message) || e) }, 500) }
   })
 

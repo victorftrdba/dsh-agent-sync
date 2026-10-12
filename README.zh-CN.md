@@ -132,7 +132,7 @@ agent_sync_sources     # 管理自定义源（list / add / delete）
 | Cline | `~/.cline/mcp_settings.json` |
 | Roo Code | `~/.roo/mcp_settings.json` |
 | Qwen Code | `~/.codeqwen/mcp.json` |
-| 自定义 | 你自己的源（JSON / TOML / 技能目录） |
+| 自定义 | 你自己的源（JSON / YAML / TOML / 技能目录） |
 
 所有路径都相对用户主目录 → **任何机器**上装了对应 agent 就能扫（Windows / macOS / Linux），JSON、类 YAML、TOML 三种配置格式都能解析。
 
@@ -150,6 +150,29 @@ agent_sync_sources     # 管理自定义源（list / add / delete）
 - **MCP** 写入每个 profile 的 `cordis.patch.yml`（插件管理的 `# --- dsh-agent-sync managed ---` 段，文件损坏会自动修复）。桌面 GUI 壳在启动时一次性组合 profile，所以 **MCP 在下次重启 DSH 后生效**；`dsh` CLI / headless 启动路径会通过 HMR 热生效。
 - **Skills** 默认**复制**、也可**软连接（junction，`skillSyncMode: link`）**到 `$DSH_HOME/skills`（全局）或 `<workspace>/.dsh/skills`（按工作区），由挂载了 `skill-filesystem` 提供方的 agent preset 会话自动发现。软连接模式下停用 = 移除 junction（不碰源目录），启用 = 重建。
 
+## MCP sync guarantees
+
+TOML is parsed with pinned `smol-toml` 1.9.1 and YAML with pinned `yaml` 2.9.1.
+Multiline arrays, quoted commas, comments, YAML block/flow arrays and folded scalars retain
+exact argv values. Missing args becomes `[]`; other args must be an array of strings.
+Invalid entries and explicitly source-disabled entries are reported individually while valid
+siblings remain eligible. Existing managed enable/disable choices are preserved.
+
+Each scanner records the absolute source config folder. Relative `cwd` resolves against that
+folder; relative pathlike commands resolve against the resulting `cwd`, or the source folder
+when `cwd` is omitted. Bare commands such as `node` stay on PATH, and argument paths are
+never rewritten. Resolution does not prove an executable exists or that its MCP server starts.
+Parse errors contain only format, source and numeric line/column (or null), without raw source,
+exception text, env values or headers.
+
+MCP sync prepares prospective state and every selected profile patch before publication,
+stages exclusive private files, checks preimages, and renames files with rollback on failure.
+A write failure reports `sync_write_failed` and rollback status with no claimed synced entries.
+Rollback conflicts preserve private recovery preimages instead of overwriting concurrent edits.
+This is an in-process filesystem transaction, not crash recovery or native startup acceptance.
+Use `agent_sync_scan` followed by `agent_sync_do` for each required profile; never hand-edit
+the generated managed section. Custom JSON, YAML and TOML sources use the same validation.
+
 ## ⚠️ 安全说明
 
 - 同步 MCP 会**原样复制 env 里的值**（数据库密码、API Key 等）到 `cordis.patch.yml` 与 `$DSH_HOME/agent-sync/state.json` —— 与源配置本来就明文存放一致。
@@ -159,7 +182,7 @@ agent_sync_sources     # 管理自定义源（list / add / delete）
 ## ❓ 常见问题
 
 **为什么什么都扫不到？**
-本机没装这些 agent，或该 agent 的配置在别处。用「自定义源」可以指向任意 JSON / TOML / 技能目录。
+本机没装这些 agent，或该 agent 的配置在别处。用「自定义源」可以指向任意 JSON / YAML / TOML / 技能目录。
 
 **同步 MCP 后需要重启 DSH 吗？**
 需要——桌面 GUI 壳启动时一次性组合 profile；`dsh` CLI / headless 路径会热生效。
