@@ -337,3 +337,97 @@ test('sync preserves existing unrelated state and managed disabled selection', (
     assert.deepEqual(entries.map((entry) => entry.id).sort(), ['mcp-fresh', 'mcp-kept'])
   } finally { run.clean() }
 })
+
+test('OpenCode local argv and remote URL survive scan/do with private string-only environment', () => {
+  const run = fixture({ ...profiles, '.config/opencode/opencode.json': { mcp: {
+    local: { type: 'local', command: ['./bin/tool', 'quoted,comma', '雪'], cwd: './work',
+      environment: { TOKEN: 'hostile-secret-opencode-env', NUMERIC: 42, OBJECT: {} }, enabled: true },
+    bare: { type: 'local', command: ['node', 'script.mjs'] },
+    remote: { type: 'remote', url: 'https://example.test/mcp',
+      headers: { Authorization: 'hostile-secret-opencode-header' }, enabled: true },
+    generic: { command: 'node', env: { LEGACY_NUMBER: 42 } },
+  } } }, [scan(['opencode']), sync(['opencode'])])
+  try {
+    const entries = Object.fromEntries(run.results[0].opencode.mcp.map((entry) => [entry.name, entry]))
+    assert.equal(entries.local.command, resolve(run.home, '.config/opencode/work/bin/tool'))
+    assert.deepEqual(entries.local.args, ['quoted,comma', '雪'])
+    assert.deepEqual(entries.local.envKeys, ['TOKEN'])
+    assert.equal(entries.bare.command, 'node')
+    assert.equal(entries.remote.transport, 'streamable-http')
+    assert.deepEqual(entries.remote.headerKeys, ['Authorization'])
+    assert.ok(!JSON.stringify(run.results).includes('hostile-secret'))
+    const state = JSON.parse(run.read('.dsh/agent-sync/state.json'))
+    assert.deepEqual(state.mcp.local.config.env, { TOKEN: 'hostile-secret-opencode-env' })
+    assert.deepEqual(state.mcp.generic.config.env, { LEGACY_NUMBER: '42' })
+    for (const profile of ['headless', 'web']) {
+      const patch = parse(run.read(`.dsh/profiles/${profile}/cordis.patch.yml`)).flatMap((row) => row.insert || [])
+      assert.deepEqual(patch.find((entry) => entry.id === 'mcp-local').config.args, ['quoted,comma', '雪'])
+      assert.equal(patch.find((entry) => entry.id === 'mcp-remote').config.url, 'https://example.test/mcp')
+      assert.deepEqual(patch.find((entry) => entry.id === 'mcp-local').config.env, state.mcp.local.config.env)
+    }
+  } finally { run.clean() }
+})
+
+test('OpenCode rejects malformed local command arrays and checks disabled before command parsing', () => {
+  const run = fixture({ ...profiles, '.config/opencode/opencode.json': { mcp: {
+    valid: { type: 'local', command: ['node', 'script.mjs'] },
+    empty: { type: 'local', command: [] },
+    string: { type: 'local', command: 'node' },
+    numeric: { type: 'local', command: ['node', 42] },
+    blank: { type: 'local', command: ['node', ''] },
+    nul: { type: 'local', command: ['node', 'hostile-secret\0arg'] },
+    disabled: { type: 'local', command: {}, enabled: false },
+  } } }, [scan(['opencode']), sync(['opencode'])])
+  try {
+    const entries = Object.fromEntries(run.results[0].opencode.mcp.map((entry) => [entry.name, entry]))
+    assert.equal(entries.disabled.error.code, 'source_disabled')
+    for (const name of ['empty', 'string', 'numeric', 'blank', 'nul']) assert.equal(entries[name].error.code, 'invalid_command')
+    assert.deepEqual(run.results[1].mcp.synced, ['valid'])
+    assert.ok(!JSON.stringify(run.results).includes('hostile-secret'))
+  } finally { run.clean() }
+})
+
+test('disabled and invalid first-source names reserve sanitized identity against later-source fallback', () => {
+  const run = fixture({ ...profiles,
+    '.codex/config.toml': '[mcp_servers."shared.name"]\nenabled=false\ncommand="node"\n[mcp_servers.invalid]\ncommand=42',
+    '.claude.json': { mcpServers: { shared_name: { command: 'node' }, invalid: { command: 'node' }, valid: { command: 'node' } } },
+  }, [sync(['codex', 'claude'])])
+  try {
+    assert.deepEqual(run.results[0].mcp.synced, ['valid'])
+    assert.ok(run.results[0].mcp.errors.some((error) => error.name === 'shared_name' && error.code === 'source_disabled'))
+    const state = JSON.parse(run.read('.dsh/agent-sync/state.json'))
+    assert.deepEqual(Object.keys(state.mcp), ['valid'])
+  } finally { run.clean() }
+})
+
+test('Codex startup timeout does not create a DSH tool-call deadline', () => {
+  const run = fixture({ ...profiles, '.codex/config.toml': '[mcp_servers.native]\ncommand="node"\nstartup_timeout_sec=123' }, [sync(['codex'])])
+  try {
+    const state = JSON.parse(run.read('.dsh/agent-sync/state.json'))
+    assert.equal(Object.hasOwn(state.mcp.native.config, 'toolCallTimeoutMs'), false)
+    for (const profile of ['headless', 'web']) assert.ok(!run.read(`.dsh/profiles/${profile}/cordis.patch.yml`).includes('toolCallTimeoutMs'))
+  } finally { run.clean() }
+})
+
+test('source-restricted canonical sync preserves missing original selections while updating valid OpenCode entries', () => {
+  const repogate = { source: 'codex', entryId: 'mcp-repogate', enabled: true,
+    config: { serverName: 'repogate', transport: 'stdio', command: 'node', args: ['preserved'], env: {} } }
+  const gmail = { source: 'hermes', entryId: 'mcp-gmail', enabled: true,
+    config: { serverName: 'gmail', transport: 'stdio', command: 'node', args: ['preserved'], env: {} } }
+  const run = fixture({ ...profiles, '.dsh/agent-sync/state.json': { mcp: { repogate, gmail }, skills: {} },
+    '.config/opencode/opencode.json': { mcp: { repogate: { type: 'local', command: ['different', 'source'] },
+      gh_grep: { type: 'remote', url: 'https://example.test/mcp' } } },
+    '.hermes/config.yaml': 'mcp_servers: {github: {command: node}}',
+  }, [sync(['codex'], ['repogate']), sync(['hermes'], ['gmail']), sync(['opencode'], ['gh_grep'])])
+  try {
+    const state = JSON.parse(run.read('.dsh/agent-sync/state.json'))
+    assert.deepEqual(state.mcp.repogate, repogate)
+    assert.deepEqual(state.mcp.gmail, gmail)
+    assert.equal(state.mcp.gh_grep.source, 'opencode')
+    assert.equal(state.mcp.gh_grep.config.transport, 'streamable-http')
+    for (const profile of ['headless', 'web']) {
+      const entries = parse(run.read(`.dsh/profiles/${profile}/cordis.patch.yml`)).flatMap((row) => row.insert || [])
+      assert.deepEqual(entries.map((entry) => entry.id).sort(), ['mcp-gh_grep', 'mcp-gmail', 'mcp-repogate'])
+    }
+  } finally { run.clean() }
+})
