@@ -133,7 +133,7 @@ agent_sync_sources     # manage custom sources (list / add / delete)
 | Cline | `~/.cline/mcp_settings.json` |
 | Roo Code | `~/.roo/mcp_settings.json` |
 | Qwen Code | `~/.codeqwen/mcp.json` |
-| Custom | your own sources (JSON / TOML / skills directory) |
+| Custom | your own sources (JSON / YAML / TOML / skills directory) |
 
 All paths are home-relative → **works on any machine** where those agents are installed
 (Windows / macOS / Linux). Configs in JSON, YAML-ish, and TOML shapes are parsed.
@@ -152,6 +152,29 @@ other agents' configs ──► scan ──► sync ──► DSH
 - **MCP** is written into each profile's `cordis.patch.yml` (a managed `# --- dsh-agent-sync managed ---` section, repaired if the file was invalid). The desktop GUI shell composes once at boot, so **MCP activates on the next DSH restart**; the `dsh` CLI / headless boot hot-applies profile patches via HMR.
 - **Skills** are copied (default) or **linked via junction** (`skillSyncMode: link`) into `$DSH_HOME/skills` (global) or `<workspace>/.dsh/skills` (per-workspace), and discovered by sessions whose agent preset mounts the `skill-filesystem` provider. In link mode, disabling a skill removes the junction (never touches the source); enabling recreates it.
 
+## MCP sync guarantees
+
+TOML is parsed with pinned `smol-toml` 1.9.1 and YAML with pinned `yaml` 2.9.1.
+Multiline arrays, quoted commas, comments, YAML block/flow arrays and folded scalars retain
+exact argv values. Missing args becomes `[]`; other args must be an array of strings.
+Invalid entries and explicitly source-disabled entries are reported individually while valid
+siblings remain eligible. Existing managed enable/disable choices are preserved.
+
+Each scanner records the absolute source config folder. Relative `cwd` resolves against that
+folder; relative pathlike commands resolve against the resulting `cwd`, or the source folder
+when `cwd` is omitted. Bare commands such as `node` stay on PATH, and argument paths are
+never rewritten. Resolution does not prove an executable exists or that its MCP server starts.
+Parse errors contain only format, source and numeric line/column (or null), without raw source,
+exception text, env values or headers.
+
+MCP sync prepares prospective state and every selected profile patch before publication,
+stages exclusive private files, checks preimages, and renames files with rollback on failure.
+A write failure reports `sync_write_failed` and rollback status with no claimed synced entries.
+Rollback conflicts preserve private recovery preimages instead of overwriting concurrent edits.
+This is an in-process filesystem transaction, not crash recovery or native startup acceptance.
+Use `agent_sync_scan` followed by `agent_sync_do` for each required profile; never hand-edit
+the generated managed section. Custom JSON, YAML and TOML sources use the same validation.
+
 ## ⚠️ Security notes
 
 - Syncing MCP **copies env values verbatim** (DB passwords, API keys, …) into `cordis.patch.yml` and `$DSH_HOME/agent-sync/state.json` — same plaintext exposure as the source configs already have.
@@ -161,7 +184,7 @@ other agents' configs ──► scan ──► sync ──► DSH
 ## ❓ FAQ
 
 **Why don't I see any MCP/Skills?**
-Nothing is installed on the machine yet, or that agent stores its config elsewhere. The `custom` source lets you point at any JSON/TOML/skills directory.
+Nothing is installed on the machine yet, or that agent stores its config elsewhere. The `custom` source lets you point at any JSON/YAML/TOML/skills directory.
 
 **Do I need to restart DSH after syncing MCP?**
 Yes — the desktop GUI shell composes its profile once at boot. The `dsh` CLI/headless path hot-applies profile patches.
