@@ -235,28 +235,32 @@ function normalizeMcp(name, raw, source, pathBase) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return invalid('invalid_mcp_config')
   if (raw.enabled === false) return invalid('source_disabled')
   const type = raw.type || (raw.command ? 'stdio' : raw.url ? 'http' : undefined)
-  if (type === 'stdio') {
-    if (typeof raw.command !== 'string' || !raw.command.trim() || raw.command.includes('\0')) return invalid('invalid_command')
-    if (raw.args !== undefined && (!Array.isArray(raw.args) || raw.args.some((arg) => typeof arg !== 'string' || arg.includes('\0')))) return invalid('invalid_args')
+  const local = source === 'opencode' && type === 'local'
+  if (type === 'stdio' || local) {
+    if (local && (!Array.isArray(raw.command) || !raw.command.length || raw.command.some((part) => typeof part !== 'string' || !part.length || part.includes('\0')))) return invalid('invalid_command')
+    const executable = local ? raw.command[0] : raw.command
+    const args = local ? raw.command.slice(1) : raw.args
+    const environment = local ? raw.environment : raw.env
+    if (typeof executable !== 'string' || !executable.trim() || executable.includes('\0')) return invalid('invalid_command')
+    if (args !== undefined && (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string' || arg.includes('\0')))) return invalid('invalid_args')
     if (raw.cwd !== undefined && (typeof raw.cwd !== 'string' || !raw.cwd.trim() || raw.cwd.includes('\0'))) return invalid('invalid_cwd')
     const cwd = raw.cwd === undefined ? undefined : isAbsolute(raw.cwd) ? raw.cwd : pathBase ? resolve(pathBase, raw.cwd) : undefined
     if (raw.cwd !== undefined && !cwd) return invalid('missing_path_base')
-    const pathlike = raw.command.includes('/') || raw.command.includes('\\')
+    const pathlike = executable.includes('/') || executable.includes('\\')
     const commandBase = cwd || pathBase
-    if (pathlike && !isAbsolute(raw.command) && !commandBase) return invalid('missing_path_base')
-    const command = pathlike && !isAbsolute(raw.command) ? resolve(commandBase, raw.command) : raw.command
+    if (pathlike && !isAbsolute(executable) && !commandBase) return invalid('missing_path_base')
+    const command = pathlike && !isAbsolute(executable) ? resolve(commandBase, executable) : executable
     const env = {}
-    if (raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env)) {
-      for (const [key, value] of Object.entries(raw.env)) {
-        if (typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))) env[key] = String(value)
+    if (environment && typeof environment === 'object' && !Array.isArray(environment)) {
+      for (const [key, value] of Object.entries(environment)) {
+        if (typeof value === 'string' || (!local && typeof value === 'number' && Number.isFinite(value))) env[key] = String(value)
       }
     }
-    const config = { serverName, transport: 'stdio', command, args: raw.args || [], env }
+    const config = { serverName, transport: 'stdio', command, args: args || [], env }
     if (cwd) config.cwd = cwd
-    if (typeof raw.startup_timeout_sec === 'number' && Number.isFinite(raw.startup_timeout_sec) && raw.startup_timeout_sec > 0) config.toolCallTimeoutMs = raw.startup_timeout_sec * 1000
     return { name: serverName, source, config }
   }
-  if (type === 'http' || type === 'streamable-http') {
+  if (type === 'http' || type === 'streamable-http' || (source === 'opencode' && type === 'remote')) {
     if (typeof raw.url !== 'string' || !raw.url.trim()) return invalid('invalid_url')
     const headers = {}
     if (raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)) {
@@ -785,16 +789,20 @@ async function collectMcpCandidates(sources) {
   const scans = await scanAll(sources)
   const byName = new Map()
   const errors = []
+  const reservedNames = new Set()
   for (const src of ALL_SOURCES) {
     errors.push(...(scans[src]?.errors || []))
     const items = (scans[src] && scans[src].mcp) || []
     for (const item of items) {
+      const serverName = sanitizeServerName(item.name)
+      if (reservedNames.has(serverName)) continue
+      reservedNames.add(serverName)
       const norm = normalizeMcp(item.name, item.raw, item.source || src, item.pathBase)
       if (norm.error) {
         errors.push(norm.error)
         continue
       }
-      if (!byName.has(norm.name)) byName.set(norm.name, norm)
+      byName.set(norm.name, norm)
     }
   }
   return { byName, errors }
